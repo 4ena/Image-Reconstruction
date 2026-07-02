@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 # -----------------------------
 # Load original image
 # -----------------------------
-img = cv2.imread("your_image.jpg")
+img = cv2.imread("lenna.jpg")
 
 if img is None:
     raise FileNotFoundError("Image not found. Make sure the file name is correct.")
@@ -30,6 +30,26 @@ def add_noise(image, noise_strength=45):
 
     return noisy_image.astype(np.uint8)
 
+# -----------------------------
+# Create Sampling Mask
+# -----------------------------
+def create_mask(image, sampling_rate=0.5):
+    """
+    Creates a random sampling mask.
+    sampling_rate = fraction of pixels kept.
+    Example: 0.5 keeps 50% of pixels.
+    """
+
+    # Create random 2D mask for image height and width
+    mask_2d = np.random.rand(image.shape[0], image.shape[1]) < sampling_rate
+
+    # If RGB, copy the same mask across all 3 channels
+    if len(image.shape) == 3:
+        mask = np.repeat(mask_2d[:, :, np.newaxis], image.shape[2], axis=2)
+    else:
+        mask = mask_2d
+
+    return mask.astype(np.float32)
 
 # -----------------------------
 # Remove noise
@@ -57,6 +77,38 @@ def remove_noise(image):
 
     return denoised_rgb
 
+# -----------------------------
+# Reconstruct Missing Pixels
+# -----------------------------
+def reconstruct_missing_pixels(sampled_image, mask):
+    """
+    Reconstructs missing pixels using OpenCV inpainting.
+    Missing pixels are where the sampling mask equals 0.
+    """
+
+    # Use one channel of the RGB mask to identify missing pixels
+    mask_2d = mask[:, :, 0]
+
+    # OpenCV inpainting mask:
+    # 255 = missing pixels to fill
+    # 0 = known pixels to keep
+    missing_pixels = (1 - mask_2d).astype(np.uint8) * 255
+
+    # Convert RGB to BGR for OpenCV
+    image_bgr = cv2.cvtColor(sampled_image, cv2.COLOR_RGB2BGR)
+
+    # Fill missing pixels
+    reconstructed_bgr = cv2.inpaint(
+        image_bgr,
+        missing_pixels,
+        inpaintRadius=3,
+        flags=cv2.INPAINT_TELEA
+    )
+
+    # Convert back to RGB for matplotlib
+    reconstructed_rgb = cv2.cvtColor(reconstructed_bgr, cv2.COLOR_BGR2RGB)
+
+    return reconstructed_rgb
 
 # -----------------------------
 # Evaluation Metrics
@@ -90,6 +142,19 @@ def calculate_psnr(original, reconstructed):
 
     return psnr
 
+def calculate_data_fidelity(reconstructed, measured, mask):
+    """
+    Measures how well the reconstruction matches the measured samples.
+    Lower data fidelity error means better measurement consistency.
+    """
+
+    reconstructed = reconstructed.astype(np.float32)
+    measured = measured.astype(np.float32)
+    mask = mask.astype(np.float32)
+
+    data_fidelity = np.mean((mask * reconstructed - measured) ** 2)
+
+    return data_fidelity
 
 # -----------------------------
 # Run sampling, noise, and denoising
@@ -109,51 +174,66 @@ noisy_img = add_noise(sampled_img, noise_strength=45)
 noisy_img = noisy_img.astype(np.float32) * mask
 noisy_img = noisy_img.astype(np.uint8)
 
-# Denoise/reconstruct
-denoised_img = remove_noise(noisy_img)
+# Reconstruct missing pixels using inpainting
+inpainted_img = reconstruct_missing_pixels(noisy_img, mask)
+
+# Denoise final reconstruction
+denoised_img = remove_noise(inpainted_img)
 
 
 # -----------------------------
-# Calculate MSE and PSNR
+# Calculate MSE, PSNR, and Data Fidelity
 # -----------------------------
 mse_noisy = calculate_mse(img_rgb, noisy_img)
+mse_inpainted = calculate_mse(img_rgb, inpainted_img)
 mse_denoised = calculate_mse(img_rgb, denoised_img)
 
 psnr_noisy = calculate_psnr(img_rgb, noisy_img)
+psnr_inpainted = calculate_psnr(img_rgb, inpainted_img)
 psnr_denoised = calculate_psnr(img_rgb, denoised_img)
 
-data_fidelity_error = calculate_data_fidelity(denoised_img, noisy_img, mask)
+data_fidelity_inpainted = calculate_data_fidelity(inpainted_img, noisy_img, mask)
+data_fidelity_denoised = calculate_data_fidelity(denoised_img, noisy_img, mask)
 
-print("MSE of Noisy Image:", mse_noisy)
-print("MSE of Denoised Image:", mse_denoised)
+print("MSE of Noisy Sampled Image:", mse_noisy)
+print("MSE of Inpainted Image:", mse_inpainted)
+print("MSE of Final Denoised Image:", mse_denoised)
 
-print("PSNR of Noisy Image:", psnr_noisy)
-print("PSNR of Denoised Image:", psnr_denoised)
+print("PSNR of Noisy Sampled Image:", psnr_noisy)
+print("PSNR of Inpainted Image:", psnr_inpainted)
+print("PSNR of Final Denoised Image:", psnr_denoised)
 
-print("Data Fidelity Error:", data_fidelity_error)
+print("Data Fidelity Error of Inpainted Image:", data_fidelity_inpainted)
+print("Data Fidelity Error of Final Denoised Image:", data_fidelity_denoised)
+
 
 # -----------------------------
 # Show images
 # -----------------------------
-plt.figure(figsize=(20, 5))
+plt.figure(figsize=(25, 5))
 
-plt.subplot(1, 4, 1)
+plt.subplot(1, 5, 1)
 plt.title("Original Image")
 plt.imshow(img_rgb)
 plt.axis("off")
 
-plt.subplot(1, 4, 2)
+plt.subplot(1, 5, 2)
 plt.title("Sampling Mask")
 plt.imshow(mask[:, :, 0], cmap="gray")
 plt.axis("off")
 
-plt.subplot(1, 4, 3)
+plt.subplot(1, 5, 3)
 plt.title("Noisy Sampled Image")
 plt.imshow(noisy_img)
 plt.axis("off")
 
-plt.subplot(1, 4, 4)
-plt.title("Denoised Image")
+plt.subplot(1, 5, 4)
+plt.title("Inpainted Image")
+plt.imshow(inpainted_img)
+plt.axis("off")
+
+plt.subplot(1, 5, 5)
+plt.title("Final Denoised Image")
 plt.imshow(denoised_img)
 plt.axis("off")
 
@@ -165,4 +245,5 @@ plt.show()
 # Save images
 # -----------------------------
 cv2.imwrite("noisy_image.jpg", cv2.cvtColor(noisy_img, cv2.COLOR_RGB2BGR))
+cv2.imwrite("inpainted_image.jpg", cv2.cvtColor(inpainted_img, cv2.COLOR_RGB2BGR))
 cv2.imwrite("denoised_image.jpg", cv2.cvtColor(denoised_img, cv2.COLOR_RGB2BGR))
