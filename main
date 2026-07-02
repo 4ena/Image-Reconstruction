@@ -92,10 +92,24 @@ def calculate_psnr(original, reconstructed):
 
 
 # -----------------------------
-# Run noise and denoising
+# Run sampling, noise, and denoising
 # -----------------------------
-noisy_img = add_noise(img_rgb, noise_strength=45)
 
+# Create sampling mask A
+mask = create_mask(img_rgb, sampling_rate=0.5)
+
+# Apply sampling mask: Ax
+sampled_img = img_rgb.astype(np.float32) * mask
+sampled_img = sampled_img.astype(np.uint8)
+
+# Add Gaussian noise to sampled image: y = Ax + n
+noisy_img = add_noise(sampled_img, noise_strength=45)
+
+# Keep only measured pixels after noise
+noisy_img = noisy_img.astype(np.float32) * mask
+noisy_img = noisy_img.astype(np.uint8)
+
+# Denoise/reconstruct
 denoised_img = remove_noise(noisy_img)
 
 
