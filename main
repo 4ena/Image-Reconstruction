@@ -1,6 +1,10 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import pywt
+from skimage.metrics import structural_similarity as ssim
+
+np.random.seed(42)
 
 # -----------------------------
 # Load original image
@@ -33,7 +37,7 @@ def add_noise(image, noise_strength=45):
 # -----------------------------
 # Create Sampling Mask
 # -----------------------------
-def create_mask(image, sampling_rate=0.5):
+def create_mask(image, sampling_rate=0.75):
     """
     Creates a random sampling mask.
     sampling_rate = fraction of pixels kept.
@@ -52,30 +56,148 @@ def create_mask(image, sampling_rate=0.5):
     return mask.astype(np.float32)
 
 # -----------------------------
-# Remove noise
+# Remove noise using lighter NLM
 # -----------------------------
 def remove_noise(image):
     """
-    Removes noise using Non-Local Means Denoising.
-    This is better than basic blur because it keeps edges clearer.
+    Removes noise using lighter Non-Local Means Denoising.
+    Lower h values reduce oversmoothing and preserve more texture.
     """
 
-    # Convert RGB back to BGR because OpenCV denoising expects BGR
     image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
     denoised_bgr = cv2.fastNlMeansDenoisingColored(
         image_bgr,
         None,
-        h=12,
-        hColor=12,
+        h=6,
+        hColor=6,
         templateWindowSize=7,
         searchWindowSize=21
     )
 
-    # Convert back to RGB
     denoised_rgb = cv2.cvtColor(denoised_bgr, cv2.COLOR_BGR2RGB)
 
     return denoised_rgb
+
+# -----------------------------
+# Edge-Preserving Bilateral Filter
+# -----------------------------
+def bilateral_denoise(image, d=7, sigma_color=35, sigma_space=35):
+    """
+    Smooths noise while preserving edges.
+    This helps clean the inpainted image before stronger denoising.
+    """
+
+    image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+    filtered_bgr = cv2.bilateralFilter(
+        image_bgr,
+        d=d,
+        sigmaColor=sigma_color,
+        sigmaSpace=sigma_space
+    )
+
+    filtered_rgb = cv2.cvtColor(filtered_bgr, cv2.COLOR_BGR2RGB)
+
+    return filtered_rgb
+
+# -----------------------------
+# Wavelet Denoising
+# -----------------------------
+def wavelet_denoise(image, wavelet="db2", level=2, threshold_scale=0.15):
+    """
+    Denoises an RGB image using wavelet thresholding.
+    
+    wavelet:
+        Type of wavelet used. "db2" is Daubechies 2.
+        
+    level:
+        Number of wavelet decomposition levels.
+        Higher level separates the image into more scales.
+        
+    threshold_scale:
+        Controls how aggressively small wavelet coefficients are removed.
+        Higher value = stronger denoising, but more smoothing.
+    """
+
+    image = image.astype(np.float32)
+
+    denoised_channels = []
+
+    # Process each color channel separately: R, G, B
+    for c in range(image.shape[2]):
+        channel = image[:, :, c]
+
+        # Decompose image channel into wavelet coefficients
+        coeffs = pywt.wavedec2(channel, wavelet=wavelet, level=level)
+
+        # Set threshold value
+        threshold = threshold_scale * np.max(channel)
+
+        # Keep approximation coefficients unchanged
+        new_coeffs = [coeffs[0]]
+
+        # Threshold detail coefficients
+        for detail_level in coeffs[1:]:
+            thresholded_details = tuple(
+                pywt.threshold(detail, threshold, mode="soft")
+                for detail in detail_level
+            )
+            new_coeffs.append(thresholded_details)
+
+        # Reconstruct channel from thresholded wavelet coefficients
+        reconstructed_channel = pywt.waverec2(new_coeffs, wavelet=wavelet)
+
+        # Crop back to original image size if wavelet padding changed it
+        reconstructed_channel = reconstructed_channel[:image.shape[0], :image.shape[1]]
+
+        denoised_channels.append(reconstructed_channel)
+
+    # Stack R, G, B channels back together
+    denoised_image = np.stack(denoised_channels, axis=2)
+
+    # Keep valid pixel range
+    denoised_image = np.clip(denoised_image, 0, 255)
+
+    return denoised_image.astype(np.uint8)
+
+# -----------------------------
+# Detail Restoration / Mild Sharpening
+# -----------------------------
+def restore_details(base_image, reference_image, amount=0.20, blur_sigma=1.0):
+    """
+    Adds a small amount of high-frequency detail back into the denoised image.
+
+    base_image:
+        The clean but smooth image, usually the hybrid result.
+
+    reference_image:
+        The image used to recover edge/detail information.
+        Use bilateral_img because it has cleaner edges than the noisy image.
+
+    amount:
+        Controls how much detail is added back.
+        Higher amount = sharper image, but can bring back noise.
+
+    blur_sigma:
+        Controls the scale of details extracted.
+    """
+
+    base = base_image.astype(np.float32)
+    reference = reference_image.astype(np.float32)
+
+    # Blur the reference to get its low-frequency structure
+    reference_blur = cv2.GaussianBlur(reference, (0, 0), blur_sigma)
+
+    # High-frequency detail layer
+    detail = reference - reference_blur
+
+    # Add a small amount of detail back to the clean image
+    restored = base + amount * detail
+
+    restored = np.clip(restored, 0, 255)
+
+    return restored.astype(np.uint8)
 
 # -----------------------------
 # Reconstruct Missing Pixels
@@ -142,9 +264,46 @@ def calculate_psnr(original, reconstructed):
 
     return psnr
 
+def calculate_ssim(original, reconstructed):
+    """
+    Calculates Structural Similarity Index.
+    Higher SSIM means better structural similarity.
+    SSIM is useful because MSE/PSNR do not always match visual quality.
+    """
+
+    original_gray = cv2.cvtColor(original, cv2.COLOR_RGB2GRAY)
+    reconstructed_gray = cv2.cvtColor(reconstructed, cv2.COLOR_RGB2GRAY)
+
+    score = ssim(
+        original_gray,
+        reconstructed_gray,
+        data_range=255
+    )
+
+    return score
+
+def compute_fourier_spectrum(image):
+    """
+    Computes the log-magnitude Fourier spectrum of an RGB image.
+    This is used for visualization, not reconstruction.
+
+    Bright center = low-frequency structure.
+    Outer regions = high-frequency detail/noise.
+    """
+
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+    f = np.fft.fft2(gray)
+    fshift = np.fft.fftshift(f)
+
+    magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1)
+
+    return magnitude_spectrum
+
 def calculate_data_fidelity(reconstructed, measured, mask):
     """
     Measures how well the reconstruction matches the measured samples.
+    This version only averages error over known/measured pixels.
     Lower data fidelity error means better measurement consistency.
     """
 
@@ -152,23 +311,50 @@ def calculate_data_fidelity(reconstructed, measured, mask):
     measured = measured.astype(np.float32)
     mask = mask.astype(np.float32)
 
-    data_fidelity = np.mean((mask * reconstructed - measured) ** 2)
+    error = mask * (reconstructed - measured)
+
+    data_fidelity = np.sum(error ** 2) / np.sum(mask)
 
     return data_fidelity
+
+# -----------------------------
+# Data Consistency Correction
+# -----------------------------
+def enforce_data_consistency(reconstructed, measured, mask, alpha=0.5):
+    """
+    Blends the denoised reconstruction with the measured samples
+    at known pixel locations.
+
+    alpha = 0 keeps the denoised reconstruction unchanged.
+    alpha = 1 fully restores the measured noisy samples.
+    alpha = 0.5 balances denoising and data fidelity.
+    """
+
+    reconstructed = reconstructed.astype(np.float32)
+    measured = measured.astype(np.float32)
+    mask = mask.astype(np.float32)
+
+    corrected = (1 - mask) * reconstructed + mask * (
+        alpha * measured + (1 - alpha) * reconstructed
+    )
+
+    corrected = np.clip(corrected, 0, 255)
+
+    return corrected.astype(np.uint8)
 
 # -----------------------------
 # Run sampling, noise, and denoising
 # -----------------------------
 
 # Create sampling mask A
-mask = create_mask(img_rgb, sampling_rate=0.5)
+mask = create_mask(img_rgb, sampling_rate=0.75)
 
 # Apply sampling mask: Ax
 sampled_img = img_rgb.astype(np.float32) * mask
 sampled_img = sampled_img.astype(np.uint8)
 
 # Add Gaussian noise to sampled image: y = Ax + n
-noisy_img = add_noise(sampled_img, noise_strength=45)
+noisy_img = add_noise(sampled_img, noise_strength=25)
 
 # Keep only measured pixels after noise
 noisy_img = noisy_img.astype(np.float32) * mask
@@ -177,73 +363,295 @@ noisy_img = noisy_img.astype(np.uint8)
 # Reconstruct missing pixels using inpainting
 inpainted_img = reconstruct_missing_pixels(noisy_img, mask)
 
-# Denoise final reconstruction
-denoised_img = remove_noise(inpainted_img)
+# Light edge-preserving cleanup after inpainting
+bilateral_img = bilateral_denoise(
+    inpainted_img,
+    d=7,
+    sigma_color=35,
+    sigma_space=35
+)
+
+# Direct NLM from inpainted image to preserve more texture
+nlm_direct_img = remove_noise(inpainted_img)
+
+# Lighter NLM after bilateral filtering
+nlm_denoised_img = remove_noise(bilateral_img)
+
+# Wavelet denoising after bilateral filtering
+wavelet_denoised_img = wavelet_denoise(
+    bilateral_img,
+    wavelet="db2",
+    level=2,
+    threshold_scale=0.12
+)
+
+# Hybrid method: bilateral + light NLM + very mild wavelet cleanup
+hybrid_denoised_img = wavelet_denoise(
+    nlm_denoised_img,
+    wavelet="db2",
+    level=2,
+    threshold_scale=0.03
+)
+
+# Restore some edge/detail information lost during denoising
+detail_restored_img = restore_details(
+    hybrid_denoised_img,
+    bilateral_img,
+    amount=0.20,
+    blur_sigma=1.0
+)
+
+final_img = nlm_direct_img
+
+# Fourier spectra for frequency-domain visualization
+spectrum_original = compute_fourier_spectrum(img_rgb)
+spectrum_noisy = compute_fourier_spectrum(noisy_img)
+spectrum_inpainted = compute_fourier_spectrum(inpainted_img)
+spectrum_hybrid = compute_fourier_spectrum(hybrid_denoised_img)
+spectrum_detail = compute_fourier_spectrum(detail_restored_img)
+
+# Apply data consistency correction
+nlm_consistent_img = enforce_data_consistency(
+    nlm_denoised_img,
+    noisy_img,
+    mask,
+    alpha=0.5
+)
+
+wavelet_consistent_img = enforce_data_consistency(
+    wavelet_denoised_img,
+    noisy_img,
+    mask,
+    alpha=0.5
+)
 
 
 # -----------------------------
 # Calculate MSE, PSNR, and Data Fidelity
 # -----------------------------
+
+# MSE
 mse_noisy = calculate_mse(img_rgb, noisy_img)
 mse_inpainted = calculate_mse(img_rgb, inpainted_img)
-mse_denoised = calculate_mse(img_rgb, denoised_img)
+mse_bilateral = calculate_mse(img_rgb, bilateral_img)
+mse_nlm = calculate_mse(img_rgb, nlm_denoised_img)
+mse_wavelet = calculate_mse(img_rgb, wavelet_denoised_img)
+mse_hybrid = calculate_mse(img_rgb, hybrid_denoised_img)
+mse_nlm_consistent = calculate_mse(img_rgb, nlm_consistent_img)
+mse_wavelet_consistent = calculate_mse(img_rgb, wavelet_consistent_img)
 
+# PSNR
 psnr_noisy = calculate_psnr(img_rgb, noisy_img)
 psnr_inpainted = calculate_psnr(img_rgb, inpainted_img)
-psnr_denoised = calculate_psnr(img_rgb, denoised_img)
+psnr_bilateral = calculate_psnr(img_rgb, bilateral_img)
+psnr_nlm = calculate_psnr(img_rgb, nlm_denoised_img)
+psnr_wavelet = calculate_psnr(img_rgb, wavelet_denoised_img)
+psnr_hybrid = calculate_psnr(img_rgb, hybrid_denoised_img)
+psnr_nlm_consistent = calculate_psnr(img_rgb, nlm_consistent_img)
+psnr_wavelet_consistent = calculate_psnr(img_rgb, wavelet_consistent_img)
 
+# SSIM
+ssim_noisy = calculate_ssim(img_rgb, noisy_img)
+ssim_inpainted = calculate_ssim(img_rgb, inpainted_img)
+ssim_bilateral = calculate_ssim(img_rgb, bilateral_img)
+ssim_nlm = calculate_ssim(img_rgb, nlm_denoised_img)
+ssim_wavelet = calculate_ssim(img_rgb, wavelet_denoised_img)
+ssim_hybrid = calculate_ssim(img_rgb, hybrid_denoised_img)
+ssim_detail = calculate_ssim(img_rgb, detail_restored_img)
+
+# Data Fidelity
 data_fidelity_inpainted = calculate_data_fidelity(inpainted_img, noisy_img, mask)
-data_fidelity_denoised = calculate_data_fidelity(denoised_img, noisy_img, mask)
+data_fidelity_bilateral = calculate_data_fidelity(bilateral_img, noisy_img, mask)
+data_fidelity_nlm = calculate_data_fidelity(nlm_denoised_img, noisy_img, mask)
+data_fidelity_wavelet = calculate_data_fidelity(wavelet_denoised_img, noisy_img, mask)
+data_fidelity_hybrid = calculate_data_fidelity(hybrid_denoised_img, noisy_img, mask)
+data_fidelity_nlm_consistent = calculate_data_fidelity(nlm_consistent_img, noisy_img, mask)
+data_fidelity_wavelet_consistent = calculate_data_fidelity(wavelet_consistent_img, noisy_img, mask)
 
+mse_detail = calculate_mse(img_rgb, detail_restored_img)
+psnr_detail = calculate_psnr(img_rgb, detail_restored_img)
+data_fidelity_detail = calculate_data_fidelity(detail_restored_img, noisy_img, mask)
+
+mse_nlm_direct = calculate_mse(img_rgb, nlm_direct_img)
+psnr_nlm_direct = calculate_psnr(img_rgb, nlm_direct_img)
+ssim_nlm_direct = calculate_ssim(img_rgb, nlm_direct_img)
+data_fidelity_nlm_direct = calculate_data_fidelity(nlm_direct_img, noisy_img, mask)
+
+# -----------------------------
+# Print Results
+# -----------------------------
 print("MSE of Noisy Sampled Image:", mse_noisy)
 print("MSE of Inpainted Image:", mse_inpainted)
-print("MSE of Final Denoised Image:", mse_denoised)
+print("MSE of Bilateral Image:", mse_bilateral)
+print("MSE of Light NLM Image:", mse_nlm)
+print("MSE of Wavelet Image:", mse_wavelet)
+print("MSE of Hybrid NLM + Wavelet Image:", mse_hybrid)
+print("MSE of NLM + Data Consistency:", mse_nlm_consistent)
+print("MSE of Wavelet + Data Consistency:", mse_wavelet_consistent)
 
 print("PSNR of Noisy Sampled Image:", psnr_noisy)
 print("PSNR of Inpainted Image:", psnr_inpainted)
-print("PSNR of Final Denoised Image:", psnr_denoised)
+print("PSNR of Bilateral Image:", psnr_bilateral)
+print("PSNR of Light NLM Image:", psnr_nlm)
+print("PSNR of Wavelet Image:", psnr_wavelet)
+print("PSNR of Hybrid NLM + Wavelet Image:", psnr_hybrid)
+print("PSNR of NLM + Data Consistency:", psnr_nlm_consistent)
+print("PSNR of Wavelet + Data Consistency:", psnr_wavelet_consistent)
+
+print("SSIM of Noisy Sampled Image:", ssim_noisy)
+print("SSIM of Inpainted Image:", ssim_inpainted)
+print("SSIM of Bilateral Image:", ssim_bilateral)
+print("SSIM of Light NLM Image:", ssim_nlm)
+print("SSIM of Wavelet Image:", ssim_wavelet)
+print("SSIM of Hybrid NLM + Wavelet Image:", ssim_hybrid)
+print("SSIM of Detail-Restored Hybrid Image:", ssim_detail)
 
 print("Data Fidelity Error of Inpainted Image:", data_fidelity_inpainted)
-print("Data Fidelity Error of Final Denoised Image:", data_fidelity_denoised)
+print("Data Fidelity Error of Bilateral Image:", data_fidelity_bilateral)
+print("Data Fidelity Error of Light NLM Image:", data_fidelity_nlm)
+print("Data Fidelity Error of Wavelet Image:", data_fidelity_wavelet)
+print("Data Fidelity Error of Hybrid NLM + Wavelet Image:", data_fidelity_hybrid)
+print("Data Fidelity Error of NLM + Data Consistency:", data_fidelity_nlm_consistent)
+print("Data Fidelity Error of Wavelet + Data Consistency:", data_fidelity_wavelet_consistent)
 
+print("MSE of Detail-Restored Hybrid Image:", mse_detail)
+print("PSNR of Detail-Restored Hybrid Image:", psnr_detail)
+print("Data Fidelity Error of Detail-Restored Hybrid Image:", data_fidelity_detail)
 
+print("MSE of Direct NLM Image:", mse_nlm_direct)
+print("PSNR of Direct NLM Image:", psnr_nlm_direct)
+print("SSIM of Direct NLM Image:", ssim_nlm_direct)
+print("Data Fidelity Error of Direct NLM Image:", data_fidelity_nlm_direct)
 # -----------------------------
 # Show images
+# -----------------------------
+plt.figure(figsize=(40, 5))
+
+plt.subplot(1, 8, 1)
+plt.title("Original")
+plt.imshow(img_rgb)
+plt.axis("off")
+
+plt.subplot(1, 8, 2)
+plt.title("Mask")
+plt.imshow(mask[:, :, 0], cmap="gray")
+plt.axis("off")
+
+plt.subplot(1, 8, 3)
+plt.title("Noisy Sampled")
+plt.imshow(noisy_img)
+plt.axis("off")
+
+plt.subplot(1, 8, 4)
+plt.title("Inpainted")
+plt.imshow(inpainted_img)
+plt.axis("off")
+
+plt.subplot(1, 8, 5)
+plt.title("Bilateral")
+plt.imshow(bilateral_img)
+plt.axis("off")
+
+plt.subplot(1, 8, 6)
+plt.title("Light NLM")
+plt.imshow(nlm_denoised_img)
+plt.axis("off")
+
+plt.subplot(1, 8, 7)
+plt.title("Hybrid")
+plt.imshow(hybrid_denoised_img)
+plt.axis("off")
+
+plt.subplot(1, 8, 8)
+plt.title("Detail Restored")
+plt.imshow(detail_restored_img)
+plt.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+# -----------------------------
+# Show Fourier Spectra
 # -----------------------------
 plt.figure(figsize=(25, 5))
 
 plt.subplot(1, 5, 1)
-plt.title("Original Image")
-plt.imshow(img_rgb)
+plt.title("Original Spectrum")
+plt.imshow(spectrum_original, cmap="gray")
 plt.axis("off")
 
 plt.subplot(1, 5, 2)
-plt.title("Sampling Mask")
-plt.imshow(mask[:, :, 0], cmap="gray")
+plt.title("Noisy Spectrum")
+plt.imshow(spectrum_noisy, cmap="gray")
 plt.axis("off")
 
 plt.subplot(1, 5, 3)
-plt.title("Noisy Sampled Image")
-plt.imshow(noisy_img)
+plt.title("Inpainted Spectrum")
+plt.imshow(spectrum_inpainted, cmap="gray")
 plt.axis("off")
 
 plt.subplot(1, 5, 4)
-plt.title("Inpainted Image")
-plt.imshow(inpainted_img)
+plt.title("Hybrid Spectrum")
+plt.imshow(spectrum_hybrid, cmap="gray")
 plt.axis("off")
 
 plt.subplot(1, 5, 5)
-plt.title("Final Denoised Image")
-plt.imshow(denoised_img)
+plt.title("Detail Restored Spectrum")
+plt.imshow(spectrum_detail, cmap="gray")
 plt.axis("off")
 
 plt.tight_layout()
 plt.show()
 
 
+plt.figure(figsize=(25, 5))
+
+plt.subplot(1, 5, 1)
+plt.title("Original")
+plt.imshow(img_rgb)
+plt.axis("off")
+
+plt.subplot(1, 5, 2)
+plt.title("Noisy Sampled")
+plt.imshow(noisy_img)
+plt.axis("off")
+
+plt.subplot(1, 5, 3)
+plt.title("Bilateral + NLM")
+plt.imshow(nlm_denoised_img)
+plt.axis("off")
+
+plt.subplot(1, 5, 4)
+plt.title("Direct NLM")
+plt.imshow(nlm_direct_img)
+plt.axis("off")
+
+plt.subplot(1, 5, 5)
+plt.title("Final Selected")
+plt.imshow(final_img)
+plt.axis("off")
+
+plt.tight_layout()
+plt.show()
 # -----------------------------
 # Save images
 # -----------------------------
 cv2.imwrite("noisy_image.jpg", cv2.cvtColor(noisy_img, cv2.COLOR_RGB2BGR))
 cv2.imwrite("inpainted_image.jpg", cv2.cvtColor(inpainted_img, cv2.COLOR_RGB2BGR))
-cv2.imwrite("denoised_image.jpg", cv2.cvtColor(denoised_img, cv2.COLOR_RGB2BGR))
+cv2.imwrite("bilateral_image.jpg", cv2.cvtColor(bilateral_img, cv2.COLOR_RGB2BGR))
+cv2.imwrite("nlm_denoised_image.jpg", cv2.cvtColor(nlm_denoised_img, cv2.COLOR_RGB2BGR))
+cv2.imwrite("wavelet_denoised_image.jpg", cv2.cvtColor(wavelet_denoised_img, cv2.COLOR_RGB2BGR))
+cv2.imwrite("hybrid_denoised_image.jpg", cv2.cvtColor(hybrid_denoised_img, cv2.COLOR_RGB2BGR))
+cv2.imwrite("nlm_consistent_image.jpg", cv2.cvtColor(nlm_consistent_img, cv2.COLOR_RGB2BGR))
+cv2.imwrite("wavelet_consistent_image.jpg", cv2.cvtColor(wavelet_consistent_img, cv2.COLOR_RGB2BGR))
+cv2.imwrite("detail_restored_image.jpg", cv2.cvtColor(detail_restored_img, cv2.COLOR_RGB2BGR))
+
+plt.imsave("spectrum_original.jpg", spectrum_original, cmap="gray")
+plt.imsave("spectrum_noisy.jpg", spectrum_noisy, cmap="gray")
+plt.imsave("spectrum_inpainted.jpg", spectrum_inpainted, cmap="gray")
+plt.imsave("spectrum_hybrid.jpg", spectrum_hybrid, cmap="gray")
+plt.imsave("spectrum_detail_restored.jpg", spectrum_detail, cmap="gray")
+
+cv2.imwrite("final_reconstructed_image.jpg", cv2.cvtColor(final_img, cv2.COLOR_RGB2BGR))
+cv2.imwrite("nlm_direct_image.jpg", cv2.cvtColor(nlm_direct_img, cv2.COLOR_RGB2BGR))
+cv2.imwrite("final_reconstructed_image.jpg", cv2.cvtColor(final_img, cv2.COLOR_RGB2BGR))
